@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+#
+# kubectl-why — explain WHY a pod isn't running, in one clear answer.
+#
+#   Usage:  kubectl why <pod> [-n namespace]
+#
+# Requires: kubectl, jq
+#
+set -euo pipefail
+
+# ---------- parse arguments ----------
+POD=""
+NS="default"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--namespace) NS="$2"; shift 2 ;;
+    -h|--help)
+      echo "Usage: kubectl why <pod> [-n namespace]"; exit 0 ;;
+    *) POD="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$POD" ]]; then
+  echo "Usage: kubectl why <pod> [-n namespace]" >&2
+  exit 1
+fi
+
+# ---------- colors ----------
+RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; DIM=$'\e[2m'; RST=$'\e[0m'
+
+# ---------- fetch the pod ----------
+if ! POD_JSON=$(kubectl get pod "$POD" -n "$NS" -o json 2>/dev/null); then
+  echo "${RED}❌ Pod \"$POD\" not found in namespace \"$NS\".${RST}" >&2
+  exit 1
+fi
+
+phase=$(echo "$POD_JSON" | jq -r '.status.phase')
+
+# ---------- helper: show recent events ----------
+print_events() {
+  echo "${DIM}Recent events:${RST}"
+  kubectl get events -n "$NS" \
+    --field-selector "involvedObject.name=$POD" \
+    --sort-by=.lastTimestamp 2>/dev/null | tail -n 5 | sed 's/^/   /' || true
+}
+
+# ---------- is it healthy? ----------
+ready=$(echo "$POD_JSON" | jq -r '[.status.containerStatuses[]?.ready] | all')
+if [[ "$phase" == "Running" && "$ready" == "true" ]]; then
+  echo "${GRN}✅ Pod \"$POD\" is Running and all containers are ready.${RST}"
+  exit 0
+fi
+
+echo "${YEL}🔍 Diagnosing pod \"$POD\" (phase: $phase)…${RST}"
+echo
+
+# ---------- containers stuck in "waiting" ----------
+waiting=$(echo "$POD_JSON" | jq -r \
+  '.status.containerStatuses[]? | select(.state.waiting != null)
+   | "\(.name)\t\(.state.waiting.reason)\t\(.state.waiting.message // "")"')
+
+if [[ -n "$waiting" ]]; then
+  while IFS=$'\t' read -r cname reason msg; do
+    case "$reason" in
+      CrashLoopBackOff)
+        echo "${RED}❌ Container \"$cname\": CrashLoopBackOff${RST}"
+        echo "   └─ It starts, crashes, and keeps restarting."
+        echo "   └─ Logs:  kubectl logs $POD -n $NS -c $cname --previous" ;;
+      ImagePullBackOff|ErrImagePull)
+        echo "${RED}❌ Container \"$cname\": $reason${RST}"
+        echo "   └─ Kubernetes can't pull the image."
+        [[ -n "$msg" ]] && echo "   └─ $msg"
+        echo "   └─ Check: image name/tag typo, or private registry needs an imagePullSecret." ;;
+      CreateContainerConfigError)
+        echo "${RED}❌ Container \"$cname\": CreateContainerConfigError${RST}"
+        echo "   └─ Usually a missing ConfigMap or Secret referenced in env/volumes."
+        [[ -n "$msg" ]] && echo "   └─ $msg" ;;
+      *)
+        echo "${RED}❌ Container \"$cname\": $reason${RST}"
+        [[ -n "$msg" ]] && echo "   └─ $msg" ;;
+    esac
+    echo
+  done <<< "$waiting"
+  print_events
+  exit 0
+fi
+
+# ---------- Pending: a scheduling problem ----------
+if [[ "$phase" == "Pending" ]]; then
+  sched_msg=$(echo "$POD_JSON" | jq -r \
+    '.status.conditions[]? | select(.type=="PodScheduled" and .status=="False") | .message // ""')
+  echo "${RED}❌ Pod \"$POD\" is Pending — not scheduled to any node.${RST}"
+  [[ -n "$sched_msg" ]] && echo "   └─ Scheduler says: $sched_msg"
+  echo "   └─ Common causes: insufficient CPU/memory, node taints, unbound PVC."
+  echo
+  print_events
+  exit 0
+fi
+
+# ---------- a container terminated (e.g. OOMKilled) ----------
+terminated=$(echo "$POD_JSON" | jq -r \
+  '.status.containerStatuses[]? | select(.state.terminated != null)
+   | "\(.name)\t\(.state.terminated.reason)\t\(.state.terminated.exitCode)"')
+
+if [[ -n "$terminated" ]]; then
+  while IFS=$'\t' read -r cname reason code; do
+    echo "${RED}❌ Container \"$cname\" terminated: $reason (exit code $code)${RST}"
+    [[ "$code" == "137" ]] && echo "   └─ Exit 137 = OOMKilled — it ran out of memory (raise limits.memory)."
+    echo "   └─ Logs:  kubectl logs $POD -n $NS -c $cname --previous"
+    echo
+  done <<< "$terminated"
+  print_events
+  exit 0
+fi
+
+# ---------- fallback ----------
+echo "${YEL}⚠️  Pod is unhealthy but no known pattern matched. Showing events:${RST}"
+print_events
