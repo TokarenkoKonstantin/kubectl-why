@@ -1,0 +1,4 @@
+# compiled binary
+/kubectl-why
+# goreleaser output
+/dist/
