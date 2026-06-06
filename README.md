@@ -6,6 +6,10 @@
 ![shell](https://img.shields.io/badge/v0.1-bash-4EAA25?logo=gnu-bash&logoColor=white)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
+<p align="center">
+  <img src="demo.gif" alt="kubectl-why diagnosing a broken pod" width="820">
+</p>
+
 ---
 
 ## The problem
@@ -15,11 +19,13 @@ Your pod is `Pending` / `CrashLoopBackOff` / `ImagePullBackOff`… and you dig t
 ## The solution
 
 ```console
-$ kubectl why my-pod
+$ kubectl why payment-api
 
-❌ Pod "my-pod" is Pending — not scheduled to any node.
-   └─ Scheduler says: 0/4 nodes available: insufficient memory.
-   └─ Common causes: insufficient CPU/memory, node taints, unbound PVC.
+🔍 Diagnosing pod "payment-api" (phase: Pending)…
+
+❌ Container "payment-api": ImagePullBackOff
+   └─ Kubernetes can't pull the image.
+   └─ Check: image name/tag typo, or private registry needs an imagePullSecret.
 ```
 
 One clear diagnosis with a concrete next step — instead of reading raw YAML.
